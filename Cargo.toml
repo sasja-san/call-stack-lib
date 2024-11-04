@@ -11,6 +11,6 @@ log = "0.4.22"
 stack-sizes = { version = "0.6.0", path = "../stack-sizes" }
 thiserror = "1.0.64"
 xmas-elf = "0.9.1"
-llvm-sys = "170.0.1"
+llvm-sys = "181"
 petgraph = "0.6.3"
 rustc-demangle = "0.1.24"

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 /*      ███████╗████████╗ █████╗ ████████╗███████╗       */
 /*      ██╔════╝╚══██╔══╝██╔══██╗╚══██╔══╝██╔════╝       */
@@ -12,6 +11,8 @@
 use crate::thumb;
 use crate::inp;
 use crate::ir;
+use crate as c; // call-stack-lib
+use crate::Target;
 
 use std::collections::{
     BTreeMap,
@@ -46,10 +47,10 @@ pub struct State
     pub symbols:                ss::Functions,
     pub stack_sizes:            HashMap<String, ss::Function>,
 
-    pub g:                      Graph<Node, ()>,
+    pub g:                      Graph<c::Node, ()>,
 
     pub indices:                BTreeMap<String, NodeIndex>,
-    pub indirects:              HashMap<String, Indirect>,
+    pub indirects:              HashMap<String, c::Indirect>,
 
     
     pub aliases:                HashMap<String, String>,
@@ -313,7 +314,7 @@ impl State
                 *self.ambiguous.entry(dehashed.to_string()).or_insert(0) += 1;
             }
 
-            let idx = self.g.add_node(Node(canonical_name.clone(), stack, false));
+            let idx = self.g.add_node(c::Node(canonical_name.clone(), stack, false));
             self.indices.insert(canonical_name.into(), idx);
 
             if let Some(def) = names
@@ -351,222 +352,6 @@ impl State
 
 
 
-    // Modified fields:
-    // - defined
-    // - edges
-    // - g
-    // - llvm_seen
-    // - indices
-    // - indirects
-    // NOTE: lines 274 - 485
-    pub fn process_llvm_bitcode(&mut self)
-    {
-        for define in self.defines.values()
-        {
-            let canonical_name = match self.aliases.get(define.name.as_str())
-            {
-                Some(canonical_name) => canonical_name,
-                None                 => { continue; } // symbol GC-ed by linker, skip
-            };
-            self.defined.insert(canonical_name.to_string());
-            let caller: NodeIndex = self.indices[canonical_name];
-            let callees_seen: &mut HashSet<NodeIndex> = self.edges.entry(caller).or_default();
-
-            for stmt in &define.callees
-            {
-                match stmt
-                {
-                    /*
-                    Stmt::Asm(expr) => {
-                        if fns_containing_asm.insert(*canonical_name) {
-                            // NB: we only print the first inline asm statement in a function
-                            warn!(
-                                "assuming that asm!(\"{}\") does *not* use the stack in `{}`",
-                                expr, canonical_name
-                            );
-                        }
-                    }
-                    // this is basically `(mem::transmute<*const u8, fn()>(&__some_symbol))()`
-                    Stmt::BitcastCall(sym) => {
-                        // XXX we have some type information for this call but it's unclear if we should
-                        // try harder -- does this ever occur in pure Rust programs?
-
-                        let sym = sym.expect("BUG? unnamed symbol is being invoked");
-                        let callee = if let Some(idx) = indices.get(sym) {
-                            *idx
-                        } else {
-                            warn!("no stack information for `{}`", sym);
-
-                            let idx = g.add_node(Node(sym, None, false));
-                            indices.insert(Cow::Borrowed(sym), idx);
-                            idx
-                        };
-
-                        g.add_edge(caller, callee, ());
-                    }
-                    */
-
-                    ir::Callee::Direct(callee) =>
-                    {
-                        let func = callee.name.as_str();
-                        match func
-                        {
-                            // no-op / debug-info
-                            "llvm.dbg.value"    => continue,
-                            "llvm.dbg.declare"  => continue,
-
-                            // no-op / compiler-hint
-                            "llvm.assume"       => continue,
-
-                            // lowers to a single instruction
-                            "llvm.trap"         => continue,
-
-                            _                   => {}
-                        }
-
-                        // no-op / compiler-hint
-                        if func.starts_with("llvm.lifetime.start")
-                            || func.starts_with("llvm.lifetime.end")
-                        {
-                            continue;
-                        }
-
-                        let mut call = |callee| 
-                        {
-                            if !callees_seen.contains(&callee) {
-                                self.g.add_edge(caller, callee, ());
-                                callees_seen.insert(callee);
-                            }
-                        };
-
-                        if self.target.is_thumb() && func.starts_with("llvm.")
-                        {
-                            // we'll analyze the machine code in the ELF file to 
-                            // figure out what these lower to
-                            continue;
-                        }
-
-                        // TODO? consider alignment and `value` argument to only include one edge
-                        // TODO? consider the `len` argument to elide the call to `*mem*`
-                        if func.starts_with("llvm.memcpy.")
-                        {
-                            if let Some(callee) = self.indices.get("memcpy")            { call(*callee); }
-                            // ARMv7-R and the like use these
-                            if let Some(callee) = self.indices.get("__aeabi_memcpy")    { call(*callee); }
-                            if let Some(callee) = self.indices.get("__aeabi_memcpy4")   { call(*callee); }
-
-                            continue;
-                        }
-
-                        // TODO? consider alignment and `value` argument to only include one edge
-                        // TODO? consider the `len` argument to elide the call to `*mem*`
-                        if func.starts_with("llvm.memset.") || func.starts_with("llvm.memmove.")
-                        {
-                            if let Some(callee) = self.indices.get("memset")            { call(*callee); }
-                            // ARMv7-R and the like use these
-                            if let Some(callee) = self.indices.get("__aeabi_memset")    { call(*callee); }
-                            if let Some(callee) = self.indices.get("__aeabi_memset4")   { call(*callee); }
-                            if let Some(callee) = self.indices.get("memclr")            { call(*callee); }
-                            if let Some(callee) = self.indices.get("__aeabi_memclr")    { call(*callee); }
-                            if let Some(callee) = self.indices.get("__aeabi_memclr4")   { call(*callee); }
-
-                            continue;
-                        }
-
-                        // XXX unclear whether these produce library calls on some platforms or not
-                        if func.starts_with("llvm.abs.")
-                            || func.starts_with("llvm.bswap.")
-                            || func.starts_with("llvm.ctlz.")
-                            || func.starts_with("llvm.cttz.")
-                            || func.starts_with("llvm.sadd.with.overflow.")
-                            || func.starts_with("llvm.smul.with.overflow.")
-                            || func.starts_with("llvm.ssub.with.overflow.")
-                            || func.starts_with("llvm.uadd.sat.")
-                            || func.starts_with("llvm.uadd.with.overflow.")
-                            || func.starts_with("llvm.umax.")
-                            || func.starts_with("llvm.umin.")
-                            || func.starts_with("llvm.umul.with.overflow.")
-                            || func.starts_with("llvm.usub.sat.")
-                            || func.starts_with("llvm.usub.with.overflow.")
-                            || func.starts_with("llvm.vector.reduce.")
-                            || func.starts_with("llvm.x86.sse2.pmovmskb.")
-                            || func == "llvm.x86.sse2.pause"
-                        {
-                            if !self.llvm_seen.contains(func)
-                            {
-                                self.llvm_seen.insert(func.to_string());
-                                warn!("assuming that `{}` directly lowers to machine code", func);
-                            }
-
-                            continue;
-                        }
-
-                        // noalias metadata does not lower to machine code
-                        if func == "llvm.experimental.noalias.scope.decl"
-                        {
-                            continue;
-                        }
-
-                        assert!(
-                            !func.starts_with("llvm."),
-                            "BUG: unhandled llvm intrinsic: {}",
-                            func
-                        );
-
-                        // some intrinsics can be directly lowered to machine code
-                        // if the intrinsic has no corresponding node (symbol in the output ELF) assume
-                        // that it has been lowered to machine code
-                        const SYMBOLLESS_INTRINSICS: &[&str] = &["memcmp"];
-                        if SYMBOLLESS_INTRINSICS.contains(&func) && !self.indices.contains_key(func) {
-                            continue;
-                        }
-
-                        // use canonical name
-                        let callee = if let Some(canon) = self.aliases.get(func)
-                        {
-                            self.indices[canon]
-                        }
-                        else
-                        {
-                            assert!(
-                                self.symbols.undefined.contains(func),
-                                "BUG: callee `{}` is unknown",
-                                func
-                            );
-
-                            if let Some(idx) = self.indices.get(func) 
-                            {
-                                *idx
-                            }
-                            else
-                            {
-                                let idx = self.g.add_node(Node(func.to_string(), None, false));
-                                self.indices.insert((*func).into(), idx);
-
-                                idx
-                            }
-                        };
-
-                        if !callees_seen.contains(&callee) 
-                        {
-                            callees_seen.insert(callee);
-                            self.g.add_edge(caller, callee, ());
-                        }
-                    }
-                    ir::Callee::Indirect(callee) => {
-                        for (key_sig, indirect) in &mut self.indirects 
-                        {
-                            if *key_sig == callee.sig 
-                            {
-                                indirect.called = true;
-                                indirect.callers.insert(caller);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     // Modified fields:
     // - 
@@ -655,7 +440,7 @@ impl State
 
                     // check the correctness of `modifies_sp` and `our_stack`
                     // also override LLVM's results when they appear to be wrong
-                    if let Local::Exact(ref mut llvm_stack) = self.g[caller].local
+                    if let c::Local::Exact(ref mut llvm_stack) = self.g[caller].local
                     {
                         if let Some(stack) = our_stack
                         {
@@ -724,16 +509,16 @@ impl State
                     }
                     else if let Some(stack) = our_stack
                     {
-                        self.g[caller].local = Local::Exact(stack);
+                        self.g[caller].local = c::Local::Exact(stack);
                     }
                     else if !modifies_sp 
                     {
                         // this happens when the function contains intra-branches and our analysis gives
                         // up (`our_stack == None`)
-                        self.g[caller].local = Local::Exact(0);
+                        self.g[caller].local = c::Local::Exact(0);
                     }
 
-                    if self.g[caller].local == Local::Unknown 
+                    if self.g[caller].local == c::Local::Unknown 
                     {
                         warn!("no stack usage information for `{}`", canonical_name);
                     }
@@ -749,7 +534,7 @@ impl State
                              no type information about the operation",
                             canonical_name,
                         );
-                        let callee = self.g.add_node( Node("?".to_string(), None, false) );
+                        let callee = self.g.add_node( c::Node("?".to_string(), None, false) );
                         self.g.add_edge(caller, callee, ());
                     }
 
@@ -758,9 +543,15 @@ impl State
                     {
                         let addr = (address as i64 + i64::from(offset)) as u64;
                         // address may be off by one due to the thumb bit being set
-                        let name = self.addr2name
-                            .get(&addr)
-                            .unwrap_or_else(|| panic!("BUG? no symbol at address {}", addr));
+                        let name = match self.addr2name.get(&addr)
+                        {
+                            Some(name) => name,
+                            None       =>
+                            {
+                                warn!("BUG? no symbol at address {}", addr);
+                                continue;
+                            }
+                        };
 
                         let callee = self.indices[name];
                         if !callees_seen.contains(&callee) 
@@ -781,9 +572,15 @@ impl State
                         else 
                         {
                             // address may be off by one due to the thumb bit being set
-                            let name = self.addr2name
-                                .get(&(addr as u64))
-                                .unwrap_or_else(|| panic!("BUG? no symbol at address {}", addr));
+                            let name = match self.addr2name.get(&(addr as u64))
+                            {
+                                Some(name) => name,
+                                None       =>
+                                {
+                                    warn!("BUG? no symbol at address {}", addr);
+                                    continue
+                                },
+                            };
 
                             let callee = self.indices[name];
                             if !callees_seen.contains(&callee) 
@@ -834,7 +631,7 @@ impl State
             // append '*' to denote that this is a function pointer
             name.push('*');
 
-            let call = self.g.add_node(Node(name.clone(), Some(0), true));
+            let call = self.g.add_node( c::Node(name.clone(), Some(0), true));
 
             for caller in &indirect.callers 
             {
@@ -844,7 +641,7 @@ impl State
             if self.has_untyped_symbols 
             {
                 // add an edge between this and a potential extern / untyped symbol
-                let extern_sym = self.g.add_node( Node("?".to_string(), None, false) );
+                let extern_sym = self.g.add_node( c::Node("?".to_string(), None, false) );
                 self.g.add_edge(call, extern_sym, ());
             }
             else
@@ -904,7 +701,7 @@ impl State
             if let Some(start) = start
             {
                   // create a new graph that only contains nodes reachable from `start`
-                  let mut g2 = DiGraph::<Node, ()>::new();
+                  let mut g2 = DiGraph::< c::Node, ()>::new();
 
                   // maps `g`'s `NodeIndex`-es to `g2`'s `NodeIndex`-es
                   let mut one2two = BTreeMap::new();
@@ -979,18 +776,18 @@ impl State
                     self.cycles.push(scc.clone());
 
                     let mut scc_local =
-                        max_of(scc.iter().map(|node| self.g[*node].local.into())).expect("UNREACHABLE");
+                        c::max_of(scc.iter().map(|node| self.g[*node].local.into())).expect("UNREACHABLE");
 
                     // the cumulative stack usage is only exact when all nodes do *not* use the stack
-                    if let Max::Exact(n) = scc_local
+                    if let c::Max::Exact(n) = scc_local
                     {
                         if n != 0
                         {
-                            scc_local = Max::LowerBound(n)
+                            scc_local = c::Max::LowerBound(n)
                         }
                     }
 
-                    let neighbors_max = max_of(scc.iter().flat_map(|inode| 
+                    let neighbors_max = c::max_of(scc.iter().flat_map(|inode| 
                     {
                         self.g.neighbors_directed(*inode, Direction::Outgoing)
                             .filter_map(|neighbor| 
@@ -1024,7 +821,7 @@ impl State
                 {
                     let inode = first;
 
-                    let neighbors_max = max_of(
+                    let neighbors_max = c::max_of(
                         self.g.neighbors_directed(inode, Direction::Outgoing)
                             .map(|neighbor| self.g[neighbor].max.expect("UNREACHABLE")),
                     );
@@ -1048,7 +845,7 @@ impl State
             while let Some(node) = topo.next(Reversed(&self.g)) {
                 debug_assert!(self.g[node].max.is_none());
 
-                let neighbors_max = max_of(
+                let neighbors_max = c::max_of(
                     self.g.neighbors_directed(node, Direction::Outgoing)
                         .map(|neighbor| self.g[neighbor].max.expect("UNREACHABLE")),
                 );
@@ -1131,268 +928,3 @@ fn is_outlined_function(name: &str) -> bool
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-/*      ████████╗ █████╗ ██████╗  ██████╗ ███████╗████████╗       */
-/*      ╚══██╔══╝██╔══██╗██╔══██╗██╔════╝ ██╔════╝╚══██╔══╝       */
-/*         ██║   ███████║██████╔╝██║  ███╗█████╗     ██║          */
-/*         ██║   ██╔══██║██╔══██╗██║   ██║██╔══╝     ██║          */
-/*         ██║   ██║  ██║██║  ██║╚██████╔╝███████╗   ██║          */
-/*         ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝          */
-/*     ████████████████████████████████████████████████████╗      */
-/*     ╚═══════════════════════════════════════════════════╝      */
-
-
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Target {
-    Other,
-    Thumbv6m,
-    Thumbv7m,
-}
-
-impl Target {
-    pub fn from_str(s: &str) -> Self
-    {
-        match s
-        {
-            "thumgvbv6m-none-eabi"    => Target::Thumbv6m,
-            "thumbv7m-none-eabi"    => Target::Thumbv7m,
-            "thumbv7em-none-eabi"   => Target::Thumbv7m,
-            "thumbv7em-none-eabihf" => Target::Thumbv7m,
-        _                           => Target::Other,
-        }
-    }
-
-    pub fn is_thumb(&self) -> bool
-    {
-        match *self {
-            Target::Thumbv6m => true,
-            Target::Thumbv7m => true,
-            Target::Other    => false,
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-/*      ███╗   ██╗ ██████╗ ██████╗ ███████╗      */
-/*      ████╗  ██║██╔═══██╗██╔══██╗██╔════╝      */
-/*      ██╔██╗ ██║██║   ██║██║  ██║█████╗        */
-/*      ██║╚██╗██║██║   ██║██║  ██║██╔══╝        */
-/*      ██║ ╚████║╚██████╔╝██████╔╝███████╗      */
-/*      ╚═╝  ╚═══╝ ╚═════╝ ╚═════╝ ╚══════╝      */
-/*     ████████████████████████████████████╗     */
-/*     ╚═══════════════════════════════════╝     */
-use std::borrow::Cow;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Node
-{
-    pub name: String,
-    pub local: Local,
-    pub max: Option<Max>,
-    pub dashed: bool,
-}
-
-#[allow(non_snake_case)]
-pub fn Node(name: String, stack: Option<u64>, dashed: bool) -> Node
-{
-    Node
-    {
-        name: name.into(),
-        local: stack.map(Local::Exact).unwrap_or(Local::Unknown),
-        max: None,
-        dashed,
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-/*      ██╗      ██████╗  ██████╗ █████╗ ██╗           */
-/*      ██║     ██╔═══██╗██╔════╝██╔══██╗██║           */
-/*      ██║     ██║   ██║██║     ███████║██║           */
-/*      ██║     ██║   ██║██║     ██╔══██║██║           */
-/*      ███████╗╚██████╔╝╚██████╗██║  ██║███████╗      */
-/*      ╚══════╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝╚══════╝      */
-/*     ██████████████████████████████████████████╗     */
-/*     ╚═════════════════════════════════════════╝     */
-use core::fmt;
-
-/// Local stack usage
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Local
-{
-    Exact(u64),
-    Unknown,
-}
-
-impl fmt::Display for Local
-{
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result
-    {
-        match *self
-        {
-            Local::Exact(n) => write!(f, "{}", n),
-            Local::Unknown => f.write_str("?"),
-        }
-    }
-}
-
-impl Into<Max> for Local
-{
-    fn into(self) -> Max
-    {
-        match self
-        {
-            Local::Exact(n) => Max::Exact(n),
-            Local::Unknown => Max::LowerBound(0),
-        }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-/*      ███╗   ███╗ █████╗ ██╗  ██╗      */
-/*      ████╗ ████║██╔══██╗╚██╗██╔╝      */
-/*      ██╔████╔██║███████║ ╚███╔╝       */
-/*      ██║╚██╔╝██║██╔══██║ ██╔██╗       */
-/*      ██║ ╚═╝ ██║██║  ██║██╔╝ ██╗      */
-/*      ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝      */
-/*     ████████████████████████████╗     */
-/*     ╚═══════════════════════════╝     */
-use core::{ops, cmp};
-
-#[derive(Clone, Copy, Eq, PartialEq, Debug)]
-pub enum Max
-{
-    Exact(u64),
-    LowerBound(u64),
-}
-
-impl ops::Add<Local> for Max {
-    type Output = Max;
-
-    fn add(self, rhs: Local) -> Max
-    {
-        match (self, rhs) {
-            (Max::Exact(lhs),      Local::Exact(rhs)) => Max::Exact(lhs + rhs),
-            (Max::Exact(lhs),      Local::Unknown)    => Max::LowerBound(lhs),
-            (Max::LowerBound(lhs), Local::Exact(rhs)) => Max::LowerBound(lhs + rhs),
-            (Max::LowerBound(lhs), Local::Unknown)    => Max::LowerBound(lhs),
-        }
-    }
-}
-
-impl ops::Add<Max> for Max {
-    type Output = Max;
-
-    fn add(self, rhs: Max) -> Max {
-        match (self, rhs) {
-            (Max::Exact(lhs),      Max::Exact(rhs))      => Max::Exact(lhs + rhs),
-            (Max::Exact(lhs),      Max::LowerBound(rhs)) => Max::LowerBound(lhs + rhs),
-            (Max::LowerBound(lhs), Max::Exact(rhs))      => Max::LowerBound(lhs + rhs),
-            (Max::LowerBound(lhs), Max::LowerBound(rhs)) => Max::LowerBound(lhs + rhs),
-        }
-    }
-}
-
-pub fn max_of(mut iter: impl Iterator<Item = Max>) -> Option<Max>
-{
-    iter.next().map(|first| iter.fold(first, max))
-}
-
-pub fn max(lhs: Max, rhs: Max) -> Max
-{
-    match (lhs, rhs)
-    {
-        (Max::Exact(lhs),      Max::Exact(rhs))      => Max::Exact(cmp::max(lhs, rhs)),
-        (Max::Exact(lhs),      Max::LowerBound(rhs)) => Max::LowerBound(cmp::max(lhs, rhs)),
-        (Max::LowerBound(lhs), Max::Exact(rhs))      => Max::LowerBound(cmp::max(lhs, rhs)),
-        (Max::LowerBound(lhs), Max::LowerBound(rhs)) => Max::LowerBound(cmp::max(lhs, rhs)),
-    }
-}
-
-impl fmt::Display for Max
-{
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result 
-    {
-        match *self 
-        {
-            Max::Exact(n)      => write!(f, "= {}", n),
-            Max::LowerBound(n) => write!(f, ">= {}", n),
-        }
-    }
-}
-
-/*      ██╗███╗   ██╗██████╗ ██╗██████╗ ███████╗ ██████╗████████╗       */
-/*      ██║████╗  ██║██╔══██╗██║██╔══██╗██╔════╝██╔════╝╚══██╔══╝       */
-/*      ██║██╔██╗ ██║██║  ██║██║██████╔╝█████╗  ██║        ██║          */
-/*      ██║██║╚██╗██║██║  ██║██║██╔══██╗██╔══╝  ██║        ██║          */
-/*      ██║██║ ╚████║██████╔╝██║██║  ██║███████╗╚██████╗   ██║          */
-/*      ╚═╝╚═╝  ╚═══╝╚═════╝ ╚═╝╚═╝  ╚═╝╚══════╝ ╚═════╝   ╚═╝          */
-/*     ██████████████████████████████████████████████████████████╗      */
-/*     ╚═════════════════════════════════════════════════════════╝      */
-
-// used to track indirect function calls (`fn` pointers)
-#[derive(Clone, Default, Debug)]
-pub struct Indirect
-{
-    pub called:  bool,
-    pub callers: HashSet<NodeIndex>,
-    pub callees: HashSet<NodeIndex>,
-}
