@@ -1,7 +1,6 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    fs::{self,File},
-    io::{self, stderr, Error, Write}, 
+    fs::File,
+    io::{stderr, Write}, 
     path::PathBuf, 
     str::FromStr
 };
@@ -30,7 +29,7 @@ fn main()
     let inp_load = cs::input::load_elf_and_potentially_bcfile(p);
     match &inp_load
     {
-        Ok(inp) => println!("ELF/BC load OK"),
+        Ok(_inp) => println!("ELF/BC load OK"),
         Err(e)  => 
         {
             println!("Error loading ELF/BC!"); 
@@ -72,7 +71,7 @@ fn main()
     // impl in output/top.rs
     {   // print TOP to stdout
         let stdout = std::io::stdout().lock();
-        s.output_top(stdout);
+        s.output_top(stdout).unwrap();
     } 
 
     // impl in output/dot.rs
