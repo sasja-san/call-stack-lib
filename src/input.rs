@@ -1,28 +1,14 @@
-// WARN: Don't commit with this shit still in the file.
-//          It's just when writing and trying things out.
-#![allow(unused_imports)]
-#![allow(dead_code)]
-#![allow(unused_variables)]
-#![allow(clippy::redundant_field_names)]
-
-use std::{
-    io::{self,Error},
-    fs::{self,File},
-    fmt::{self,Display},
-    path::PathBuf,
-};
-
-use log::{ info, warn, error, trace };
-use xmas_elf::{
-    ElfFile,
-    sections::{SectionData, SectionHeader},
-    symbol_table::Entry,
-};
+use std::{ io, fs, path::PathBuf, };
+use log::{ info, warn };
+use xmas_elf::ElfFile;
 
 use thiserror::Error;
 
 
 
+///
+/// Errors which may occur when loading `InputData`.
+///
 #[derive(Error, Debug)]
 pub enum InputError
 {
@@ -39,8 +25,7 @@ pub enum InputError
 
 
 ///
-/// Lifetimes are `'static` because any program using this is most likely
-/// single-pass and there should only ever exist one instance of `InputData`.
+/// Containing the successfully loaded data.
 ///
 #[derive(Clone, Debug)]
 pub struct InputData
@@ -51,6 +36,8 @@ pub struct InputData
     pub bc_bytes:   Vec<u8>,
 }
 
+
+#[allow(clippy::new_without_default)] // default doesn't make sense
 impl InputData
 {
     pub fn new() -> Self {
@@ -68,9 +55,9 @@ impl InputData
 /// Load the file provided by `elf_fp`.
 /// Then looks for the section `.llvmbc` (LLVM Bit Code) within the file.
 /// If the section isn't found within the ELF, it instead adds "bc" to the
-/// path and loads that file as the bit code segment.
-///
-/// So given that `elf_fp` is `target/my_bin.elf` it will first read
+/// path and loads that file as the bit code segment.\
+/// \
+/// Given that `elf_fp` is `target/my_bin.elf` it will first read
 /// `my_bin.elf`. If the section `.lvvmbc` is contained, then it's done.
 /// If the section `.llvmbc` is not found it reads `my_bin.elfbc` and
 /// treats that as the bitcode segment. No validity checks is dode if the
@@ -104,10 +91,10 @@ pub fn load_elf_and_potentially_bcfile(elf_fp: PathBuf)
 
         let inp = InputData
         {
-            elf_path:   elf_path,
-            elf_bytes:  elf_bytes,
-            bc_path:    bc_path,
-            bc_bytes:   bc_bytes,
+            elf_path,
+            elf_bytes,
+            bc_path,
+            bc_bytes,
         };
         Ok(inp)
     }
@@ -115,16 +102,16 @@ pub fn load_elf_and_potentially_bcfile(elf_fp: PathBuf)
     {
         // No LLVMBC section found, look elsewhere
         let bc_path = elf_path.clone().with_extension("bc");
-        info!("No .llvmbc in ELF,  looking for bc file {:?}", bc_path);
+        warn!("No .llvmbc in ELF,  looking for bc file {:?}", bc_path);
 
         let bc_bytes = fs::read(&bc_path)?;
 
         let inp = InputData
         {
-            elf_path:   elf_path,
-            elf_bytes:  elf_bytes,
-            bc_path:    bc_path,
-            bc_bytes:   bc_bytes,
+            elf_path,
+            elf_bytes,
+            bc_path,
+            bc_bytes,
         };
         Ok(inp)
     }

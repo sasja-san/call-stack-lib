@@ -1,28 +1,18 @@
-use crate as c;
-use crate::state::State;
-
-use petgraph::graph::NodeIndex;
-use std::collections::HashSet;
-use crate::Target;
-
-/*
-::{
-    algo,
-    graph::{DiGraph, NodeIndex},
-    visit::{Dfs, Reversed, Topo},
-    Direction, Graph,
-};
-*/
-
-use log::{error, warn, info, trace};
+use log::warn;
 
 use std::ffi::CStr;
 use std::ptr::null_mut;
 use std::str;
 
-// use anyhow::bail;
 use llvm_sys::core::*;
 use llvm_sys::prelude::{LLVMBasicBlockRef, LLVMModuleRef, LLVMTypeRef, LLVMValueRef};
+
+use petgraph::graph::NodeIndex;
+use std::collections::HashSet;
+
+use crate as c;
+use crate::state::State;
+
 
 #[derive(Clone, Debug)]
 pub struct Module {
@@ -58,6 +48,13 @@ pub struct DirectCallee {
 pub struct IndirectCallee {
     pub sig: String,
 }
+
+/*     ██████╗  █████╗ ██████╗ ███████╗███████╗     */
+/*     ██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔════╝     */
+/*     ██████╔╝███████║██████╔╝███████╗█████╗       */
+/*     ██╔═══╝ ██╔══██║██╔══██╗╚════██║██╔══╝       */
+/*     ██║     ██║  ██║██║  ██║███████║███████╗     */
+/*     ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝     */
 
 pub fn parse(bitcode: &[u8]) -> Result<Module, &str> {
     unsafe {
@@ -120,6 +117,7 @@ pub fn parse(bitcode: &[u8]) -> Result<Module, &str> {
     }
 }
 
+#[allow(dead_code)]
 unsafe fn stringify(v: LLVMValueRef) -> String {
     CStr::from_ptr(LLVMPrintValueToString(v))
         .to_str()
@@ -180,17 +178,42 @@ unsafe fn iter_instructions(m: LLVMBasicBlockRef) -> impl Iterator<Item = LLVMVa
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*      ███████╗████████╗ █████╗ ████████╗███████╗       */
+/*      ██╔════╝╚══██╔══╝██╔══██╗╚══██╔══╝██╔════╝       */
+/*      ███████╗   ██║   ███████║   ██║   █████╗         */
+/*      ╚════██║   ██║   ██╔══██║   ██║   ██╔══╝         */
+/*      ███████║   ██║   ██║  ██║   ██║   ███████╗       */
+/*      ╚══════╝   ╚═╝   ╚═╝  ╚═╝   ╚═╝   ╚══════╝       */
+/*     ███████████████████████████████████████████╗      */
+/*     ╚══════════════════════════════════════════╝      */
+
 impl State
 {
 
-    // Modified fields:
-    // - defined
-    // - edges
-    // - g
-    // - llvm_seen
-    // - indices
-    // - indirects
-    // NOTE: lines 274 - 485
+    /// 
+    /// Modified fields:
+    /// - `defined`
+    /// - `edges`
+    /// - `g`
+    /// - `llvm_seen`
+    /// - `indices`
+    /// - `indirects`
+    ///
     pub fn process_llvm_bitcode(&mut self)
     {
         for define in self.defines.values()

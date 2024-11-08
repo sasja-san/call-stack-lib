@@ -8,8 +8,7 @@
 /*     ███████████████████████████████████████████╗      */
 /*     ╚══════════════════════════════════════════╝      */
 
-use crate::thumb;
-use crate::inp;
+use crate::input;
 use crate::ir;
 use crate as c; // call-stack-lib
 use crate::Target;
@@ -25,19 +24,14 @@ use petgraph::{
     visit::{Dfs, Reversed, Topo},
     Direction, Graph,
 };
-use xmas_elf::{
-    sections::{SectionData, SectionHeader},
-    symbol_table::Entry, 
-    ElfFile
-};
 
-use log::{error, warn, info, trace};
+use log::{error, warn};
 
 
 #[derive(Clone, Debug)]
 pub struct State
 {
-    pub input:                  crate::inp::InputData,
+    pub input:                  c::input::InputData,
     pub target:                 Target,
     pub declares:               HashMap<String, ir::DeclaredFunction>,
     pub defines:                HashMap<String, ir::Function>,
@@ -75,7 +69,7 @@ pub struct State
 
 
 /// This is ported from the code in `src/main.rs::run()` from
-/// https://github.com/Dirbaio/cargo-call-stack (commit 
+/// <https://github.com/Dirbaio/cargo-call-stack> (commit 
 /// 49c395ea310a16896f1bcbf3f0377a125be5ab66).
 ///
 /// Since it was all based on one giant function (820 lines) it was
@@ -88,7 +82,7 @@ impl State
     {
         State
         {
-            input:                  crate::inp::InputData::new(),
+            input:                  c::input::InputData::new(),
             target:                 Target::Other,
             declares:               HashMap::new(),
             defines:                HashMap::new(),
@@ -119,14 +113,13 @@ impl State
 
     ///
     /// Modified symbols:
-    ///     - `target`
-    ///     - `input`
-    ///     - `declares`
-    ///     - `defines`
-    ///     - `symbols`
+    /// - `target`
+    /// - `input`
+    /// - `declares`
+    /// - `defines`
+    /// - `symbols`
     ///
-    // NOTE: lines 100 - 118
-    pub fn load_input(&mut self, inp_data: inp::InputData, target: Target)
+    pub fn load_input(&mut self, inp_data: input::InputData, target: Target)
     {
         self.target = target;
         // share the inp_data around a bit before transferring ownership
@@ -145,14 +138,15 @@ impl State
         // extract stack size information
         // extract list of "live" symbols (symbols that have not been GC-ed by the linker)
         // this time we use the ELF and not the object file
-        self.symbols = ss::analyze_executable(&inp_data.elf_bytes).unwrap();
+        self.symbols = ss::analyze_executable(inp_data.elf_bytes.clone()).unwrap();
 
         self.input  = inp_data;
     }
 
+    ///
     /// Modified fields:
-    /// - symbols
-    // NOTE: lines 119 - 127
+    /// - `symbols`
+    ///
     pub fn clear_thumb_bit(&mut self)
     {
         // Clear the thumb bit.
@@ -167,9 +161,10 @@ impl State
     }
 
 
+    ///
     /// Modified fields:
-    /// - stack_sizes
-    // NOTE: lines 128 - 135
+    /// - `stack_sizes`
+    ///
     pub fn indexing_from_stack_sizes_section(&mut self)
     {
         for (_addr, func) in &self.symbols.defined
@@ -181,12 +176,12 @@ impl State
         }
     }
 
+    ///
     /// Modified fields:
-    /// - symbols.undefined
-    // NOTE: lines 136 - 148
+    /// - `symbols.undefined`
+    ///
     pub fn remove_version_strings_from_undefined_symbols(&mut self)
     {
-
         self.symbols.undefined = self.symbols
             .undefined
             .clone()
@@ -206,11 +201,11 @@ impl State
             .collect();
     }
 
-    // NOTE: lines 149 - 163 is var inits
 
+    ///
     /// Modified fields:
-    /// - default_methods
-    // NOTE: lines 164 - 183
+    /// - `default_methods`
+    ///
     pub fn default_method_demangle_pass(&mut self)
     {
         for name in self.defines.keys()
@@ -229,7 +224,7 @@ impl State
                     {
                         // trait_ = `crate::module::Trait`, rhs = `method::hdeadbeef`
 
-                        if let Some(method) = dehash(rhs) {
+                        if let Some(method) = c::dehash(rhs) {
                             self.default_methods.insert(format!("{}::{}", trait_, method));
                         }
                     }
@@ -238,17 +233,18 @@ impl State
         }
     }
 
-    // NOTE: lines 184 - 187 is var inits
 
+
+    ///
     /// Modified fields:
-    /// - aliases
-    /// - addr2name
-    /// - has_stack_usage_info
-    /// - ambiguous
-    /// - indices
-    /// - indirects
-    /// - has_untyped_symbols
-    // NOTE: lines 188 - 267
+    /// - `aliases`
+    /// - `addr2name`
+    /// - `has_stack_usage_info`
+    /// - `ambiguous`
+    /// - `indices`
+    /// - `indirects`
+    /// - `has_untyped_symbols`
+    ///
     pub fn add_real_nodes(&mut self)
     {
         let syms = self.symbols.clone();
@@ -309,7 +305,7 @@ impl State
             }
 
             let demangled = rustc_demangle::demangle(&canonical_name).to_string();
-            if let Some(dehashed) = dehash(&demangled)
+            if let Some(dehashed) = c::dehash(&demangled)
             {
                 *self.ambiguous.entry(dehashed.to_string()).or_insert(0) += 1;
             }
@@ -337,7 +333,7 @@ impl State
             {
                 self.indirects.entry(sig).or_default().callees.insert(idx);
             }
-            else if !is_outlined_function(&canonical_name)
+            else if !c::is_outlined_function(&canonical_name)
             {
                 // ^ functions produced by LLVM's function outliner are never called through function
                 // pointers (as of LLVM 14.0.6)
@@ -348,259 +344,12 @@ impl State
 
     }
 
-    // NOTE: lines 268 - 273 is var inits
 
 
-
-
-    // Modified fields:
-    // - 
-    // NOTE: lines 486 - 681
-    pub fn process_elf_machine_code(&mut self)
-    {
-        // here we parse the machine code in the ELF file to find out edges that don't appear in the
-        // LLVM-IR (e.g. `fadd` operation, `call llvm.umul.with.overflow`, etc.) or are difficult to
-        // disambiguate from the LLVM-IR (e.g. does this `llvm.memcpy` lower to a call to
-        // `__aebi_memcpy`, a call to `__aebi_memcpy4` or machine instructions?)
-        
-        let elf = ElfFile::new(&self.input.elf_bytes).unwrap();
-
-        if self.target.is_thumb() {
-            let sect: SectionHeader = elf.find_section_by_name(".symtab").expect("UNREACHABLE");
-            let mut tags: Vec<(u32, thumb::Tag)> = match sect.get_data(&elf).unwrap()
-            {
-                SectionData::SymbolTable32(entries) => entries
-                    .iter()
-                    .filter_map(|entry| 
-                    {
-                        let addr = entry.value() as u32;
-                        entry.get_name(&elf).ok().and_then(|name| 
-                        {
-                            if      name.starts_with("$d") { Some((addr, thumb::Tag::Data)) } 
-                            else if name.starts_with("$t") { Some((addr, thumb::Tag::Thumb)) }
-                            else                           { None }
-                        })
-                    })
-                    .collect(),
-                _ => unreachable!(),
-            };
-
-            tags.sort_by(|a, b| a.0.cmp(&b.0));
-
-            if let Some(sect) = elf.find_section_by_name(".text") {
-                let stext = sect.address() as u32;
-                let text = sect.raw_data(&elf);
-
-                for (address, sym) in &self.symbols.defined {
-                    let address = *address as u32;
-                    let canonical_name: String = self.aliases[&sym.names[0]].to_string();
-                    let mut size = sym.size as u32;
-
-                    if size == 0 {
-                        // try harder at finding out the size of this symbol
-                        if let Ok(needle) = tags.binary_search_by(|tag| tag.0.cmp(&address)) 
-                        {
-                            let start = tags[needle];
-                            if start.1 == thumb::Tag::Thumb
-                            {
-                                if let Some(end) = tags.get(needle + 1)
-                                {
-                                    if end.1 == thumb::Tag::Thumb
-                                    {
-                                        size = end.0 - start.0;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let start = (address - stext) as usize;
-                    let end = start + size as usize;
-                    let (bls, bs, indirect, modifies_sp, our_stack) = thumb::analyze(
-                        &text[start..end],
-                        address,
-                        self.target == Target::Thumbv7m,
-                        &tags,
-                    );
-                    let caller = self.indices[&canonical_name];
-
-                    // sanity check
-                    if let Some(stack) = our_stack
-                    {
-                        assert_eq!(
-                            stack != 0,
-                            modifies_sp,
-                            "BUG: our analysis reported that `{}` both uses {} bytes of stack and \
-                             it does{} modify SP",
-                            canonical_name,
-                            stack,
-                            if !modifies_sp { " not" } else { "" }
-                        );
-                    }
-
-                    // check the correctness of `modifies_sp` and `our_stack`
-                    // also override LLVM's results when they appear to be wrong
-                    if let c::Local::Exact(ref mut llvm_stack) = self.g[caller].local
-                    {
-                        if let Some(stack) = our_stack
-                        {
-                            if *llvm_stack != stack && self.fns_containing_asm.contains(&canonical_name)
-                            {
-                                // LLVM's stack usage analysis ignores inline asm, so its results can
-                                // be wrong here
-
-                                warn!(
-                                    "LLVM reported that `{}` uses {} bytes of stack but \
-                                     our analysis reported {} bytes; overriding LLVM's result (function \
-                                     uses inline assembly)",
-                                    canonical_name, llvm_stack, stack
-                                );
-
-                                *llvm_stack = stack;
-                            }
-                            else if is_outlined_function(&canonical_name)
-                            {
-                                // ^ functions produced by LLVM's function outliner are not properly
-                                // analyzed by LLVM's emit-stack-sizes pass and are all assigned a stack
-                                // usage of 0 bytes, which is sometimes wrong
-                                if *llvm_stack == 0 && stack != *llvm_stack
-                                {
-                                    warn!(
-                                        "LLVM reported that `{}` uses {} bytes of stack but \
-                                         our analysis reported {} bytes; overriding LLVM's result \
-                                         (function was produced by LLVM's function outlining pass)",
-                                        canonical_name, llvm_stack, stack
-                                    );
-
-                                    *llvm_stack = stack;
-                                }
-                            }
-                            else
-                            {
-                                // in all other cases our results should match
-                                if stack != *llvm_stack
-                                {
-                                    warn!(
-                                        "BUG: LLVM reported that `{}` uses {} bytes of stack but \
-                                         our analysis reported {} bytes; overriding LLVM's result \
-                                         (this should match, it's probably a bug)",
-                                        canonical_name, llvm_stack, stack
-                                    );
-
-                                    *llvm_stack = stack;
-                                }
-                                //assert_eq!(
-                                //    *llvm_stack, stack,
-                                //    "BUG: LLVM reported that `{}` uses {} bytes of stack but \
-                                //     this doesn't match our analysis",
-                                //    canonical_name, llvm_stack
-                                //);
-                            }
-                        }
-
-                        assert_eq!(
-                            *llvm_stack != 0,
-                            modifies_sp,
-                            "BUG: LLVM reported that `{}` uses {} bytes of stack but this doesn't \
-                             match our analysis",
-                            canonical_name,
-                            *llvm_stack
-                        );
-                    }
-                    else if let Some(stack) = our_stack
-                    {
-                        self.g[caller].local = c::Local::Exact(stack);
-                    }
-                    else if !modifies_sp 
-                    {
-                        // this happens when the function contains intra-branches and our analysis gives
-                        // up (`our_stack == None`)
-                        self.g[caller].local = c::Local::Exact(0);
-                    }
-
-                    if self.g[caller].local == c::Local::Unknown 
-                    {
-                        warn!("no stack usage information for `{}`", canonical_name);
-                    }
-
-                    if !self.defined.contains(&canonical_name) && indirect
-                    {
-                        // this function performs an indirect function call and we have no type
-                        // information to narrow down the list of callees so inject the uncertainty
-                        // in the form of a call to an unknown function with unknown stack usage
-
-                        warn!(
-                            "`{}` performs an indirect function call and there's \
-                             no type information about the operation",
-                            canonical_name,
-                        );
-                        let callee = self.g.add_node( c::Node("?".to_string(), None, false) );
-                        self.g.add_edge(caller, callee, ());
-                    }
-
-                    let callees_seen = self.edges.entry(caller).or_default();
-                    for offset in bls
-                    {
-                        let addr = (address as i64 + i64::from(offset)) as u64;
-                        // address may be off by one due to the thumb bit being set
-                        let name = match self.addr2name.get(&addr)
-                        {
-                            Some(name) => name,
-                            None       =>
-                            {
-                                warn!("BUG? no symbol at address {}", addr);
-                                continue;
-                            }
-                        };
-
-                        let callee = self.indices[name];
-                        if !callees_seen.contains(&callee) 
-                        {
-                            self.g.add_edge(caller, callee, ());
-                            callees_seen.insert(callee);
-                        }
-                    }
-
-                    for offset in bs
-                    {
-                        let addr = (address as i32 + offset) as u32;
-
-                        if addr >= address && addr < (address + size) 
-                        {
-                            // intra-function B branches are not function calls
-                        } 
-                        else 
-                        {
-                            // address may be off by one due to the thumb bit being set
-                            let name = match self.addr2name.get(&(addr as u64))
-                            {
-                                Some(name) => name,
-                                None       =>
-                                {
-                                    warn!("BUG? no symbol at address {}", addr);
-                                    continue
-                                },
-                            };
-
-                            let callee = self.indices[name];
-                            if !callees_seen.contains(&callee) 
-                            {
-                                self.g.add_edge(caller, callee, ());
-                                callees_seen.insert(callee);
-                            }
-                        }
-                    }
-                }
-            } 
-            else 
-            {
-                error!(".text section not found")
-            }
-        }
-    }
-    // Modified fields:
-    // - 
-    // NOTE: lines 682 - 690
+    ///
+    /// Modified fields:
+    /// - `N/A`
+    ///
     pub fn warn_for_unmodified_bits(&mut self)
     {
         // add fictitious nodes for indirect function calls
@@ -613,9 +362,10 @@ impl State
     }
 
 
-    // Modified fields:
-    // - g
-    // NOTE: lines 691 - 722
+    ///
+    /// Modified fields:
+    /// - `g`
+    ///
     pub fn add_indirect_calls_to_graph(&mut self)
     {
         for (sig, indirect) in &self.indirects
@@ -659,9 +409,11 @@ impl State
         }
     }
 
-    // Modified fields:
-    // - 
-    // NOTE: lines 723 - 789
+    ///
+    /// Modified fields:
+    /// - `g`
+    /// - `indices`
+    ///
     pub fn filter_call_graph(&mut self, starting_node: Option<String>)
     {
         if let Some(start) = starting_node
@@ -744,13 +496,14 @@ impl State
     }
 
 
-    // NOTE: lines 790 - 791 is var inits
 
 
 
-    // Modified fields:
-    // - 
-    // NOTE: lines 792 - 871
+    ///
+    /// Modified fields:
+    /// - `cycles`
+    /// - `g`
+    ///
     pub fn stack_usage_analysis(&mut self)
     {
 
@@ -864,16 +617,17 @@ impl State
     }
 
 
-    // Modified fields:
-    // - 
-    // NOTE: lines 872 - 882
+    ///
+    /// Modified fields:
+    /// - `ambiguous`
+    ///
     pub fn unambiguously_shorten_symbol_names(&mut self)
     {
         for node in self.g.node_weights_mut()
         {
             let demangled = rustc_demangle::demangle(&node.name).to_string();
 
-            if let Some(dehashed) = dehash(&demangled)
+            if let Some(dehashed) = c::dehash(&demangled)
             {
                 if self.ambiguous[dehashed] == 1
                 {
@@ -884,47 +638,4 @@ impl State
     }
 }
 
-
-// removes hashes like `::hfc5adc5d79855638`, if present
-fn dehash(demangled: &str) -> Option<&str> 
-{
-    const HASH_LENGTH: usize = 19;
-
-    let len = demangled.as_bytes().len();
-    if len > HASH_LENGTH
-    {
-        if demangled
-            .get(len - HASH_LENGTH..)
-            .map(|hash| hash.starts_with("::h"))
-            .unwrap_or(false)
-        {
-            Some(&demangled[..len - HASH_LENGTH])
-        }
-        else 
-        {
-            None
-        }
-    }
-    else 
-    {
-        None
-    }
-}
-
-
-
-
-// LLVM's function outliner pass produces symbols of the form `OUTLINED_FUNCTION_NNN` where `NNN` is
-// a monotonically increasing number
-fn is_outlined_function(name: &str) -> bool
-{
-    if let Some(number) = name.strip_prefix("OUTLINED_FUNCTION_")
-    {
-        u64::from_str_radix(number, 10).is_ok()
-    }
-    else 
-    {
-        false
-    }
-}
 

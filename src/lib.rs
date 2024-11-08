@@ -1,16 +1,21 @@
+//! Library for creating a call graph from a compiled Rust program.
+//! This graph will be annotated with each functions (nodes) stack 
+//! usage in bytes.\
+//! \
+//! Mainly created to simplify the code in the `cargo-call-stack` 
+//! program.
+//!
 
-#![allow(unused_imports)]
-#![allow(dead_code)]
-#![allow(unused_variables)]
-#![allow(clippy::redundant_field_names)]
+// #![deny(rust_2018_idioms)]
+// #![deny(missing_docs)]
+#![deny(warnings)]
 
-pub mod inp;
+
+pub mod input;
+pub mod output;
 pub mod ir;
 pub mod state;
 pub mod thumb;
-
-use petgraph as pg;
-// pub mod pg::graph::NodeIndex;
 
 
 
@@ -41,11 +46,11 @@ impl Target {
     {
         match s
         {
-            "thumgvbv6m-none-eabi"    => Target::Thumbv6m,
+            "thumgvbv6m-none-eabi"  => Target::Thumbv6m,
             "thumbv7m-none-eabi"    => Target::Thumbv7m,
             "thumbv7em-none-eabi"   => Target::Thumbv7m,
             "thumbv7em-none-eabihf" => Target::Thumbv7m,
-        _                           => Target::Other,
+            _                       => Target::Other,
         }
     }
 
@@ -77,7 +82,6 @@ impl Target {
 /*      ╚═╝  ╚═══╝ ╚═════╝ ╚═════╝ ╚══════╝      */
 /*     ████████████████████████████████████╗     */
 /*     ╚═══════════════════════════════════╝     */
-use std::borrow::Cow;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Node
@@ -256,19 +260,68 @@ impl fmt::Display for Max
 /*     ██████████████████████████████████████████████████████████╗      */
 /*     ╚═════════════════════════════════════════════════════════╝      */
 
-use std::collections::{
-    BTreeMap,
-    HashMap, HashSet,
-};
-
+use std::collections::HashSet;
 use petgraph::graph::NodeIndex;
 
-// used to track indirect function calls (`fn` pointers)
+///
+/// Used to track indirect function calls (`fn` pointers).
+///
 #[derive(Clone, Default, Debug)]
 pub struct Indirect
 {
     pub called:  bool,
     pub callers: HashSet<NodeIndex>,
     pub callees: HashSet<NodeIndex>,
+}
+
+
+
+
+
+///
+/// Removes hashes like `::hfc5adc5d79855638`, if present.
+///
+fn dehash(demangled: &str) -> Option<&str> 
+{
+    const HASH_LENGTH: usize = 19;
+
+    let len = demangled.as_bytes().len();
+    if len > HASH_LENGTH
+    {
+        if demangled
+            .get(len - HASH_LENGTH..)
+            .map(|hash| hash.starts_with("::h"))
+            .unwrap_or(false)
+        {
+            Some(&demangled[..len - HASH_LENGTH])
+        }
+        else 
+        {
+            None
+        }
+    }
+    else 
+    {
+        None
+    }
+}
+
+
+
+///
+/// LLVM's function outliner pass produces symbols of the 
+/// form `OUTLINED_FUNCTION_NNN` where `NNN` is a 
+/// monotonically increasing number.
+///
+fn is_outlined_function(name: &str) -> bool
+{
+    if let Some(number) = name.strip_prefix("OUTLINED_FUNCTION_")
+    {
+        u64::from_str_radix(number, 10).is_ok()
+    }
+    else 
+    {
+        false
+    }
 }
 

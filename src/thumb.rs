@@ -1,6 +1,291 @@
+
+/*      ███████╗████████╗ █████╗ ████████╗███████╗       */
+/*      ██╔════╝╚══██╔══╝██╔══██╗╚══██╔══╝██╔════╝       */
+/*      ███████╗   ██║   ███████║   ██║   █████╗         */
+/*      ╚════██║   ██║   ██╔══██║   ██║   ██╔══╝         */
+/*      ███████║   ██║   ██║  ██║   ██║   ███████╗       */
+/*      ╚══════╝   ╚═╝   ╚═╝  ╚═╝   ╚═╝   ╚══════╝       */
+/*     ███████████████████████████████████████████╗      */
+/*     ╚══════════════════════════════════════════╝      */
+
+use crate as c;
+
+use xmas_elf::{
+    sections::{SectionData, SectionHeader},
+    symbol_table::Entry, 
+    ElfFile
+};
+use log::{error, warn};
+
+impl crate::state::State
+{
+    ///
+    /// Modified fields:
+    /// - `g`
+    /// 
+    pub fn process_elf_machine_code(&mut self)
+    {
+        // here we parse the machine code in the ELF file to find out edges that don't appear in the
+        // LLVM-IR (e.g. `fadd` operation, `call llvm.umul.with.overflow`, etc.) or are difficult to
+        // disambiguate from the LLVM-IR (e.g. does this `llvm.memcpy` lower to a call to
+        // `__aebi_memcpy`, a call to `__aebi_memcpy4` or machine instructions?)
+        
+        let elf = ElfFile::new(&self.input.elf_bytes).unwrap();
+
+        if self.target.is_thumb() {
+            let sect: SectionHeader = elf.find_section_by_name(".symtab").expect("UNREACHABLE");
+            let mut tags: Vec<(u32, c::thumb::Tag)> = match sect.get_data(&elf).unwrap()
+            {
+                SectionData::SymbolTable32(entries) => entries
+                    .iter()
+                    .filter_map(|entry| 
+                    {
+                        let addr = entry.value() as u32;
+                        entry.get_name(&elf).ok().and_then(|name| 
+                        {
+                            if      name.starts_with("$d") { Some((addr, c::thumb::Tag::Data)) } 
+                            else if name.starts_with("$t") { Some((addr, c::thumb::Tag::Thumb)) }
+                            else                           { None }
+                        })
+                    })
+                    .collect(),
+                _ => unreachable!(),
+            };
+
+            tags.sort_by(|a, b| a.0.cmp(&b.0));
+
+            if let Some(sect) = elf.find_section_by_name(".text") {
+                let stext = sect.address() as u32;
+                let text = sect.raw_data(&elf);
+
+                for (address, sym) in &self.symbols.defined {
+                    let address = *address as u32;
+                    let canonical_name: String = self.aliases[&sym.names[0]].to_string();
+                    let mut size = sym.size as u32;
+
+                    if size == 0 {
+                        // try harder at finding out the size of this symbol
+                        if let Ok(needle) = tags.binary_search_by(|tag| tag.0.cmp(&address)) 
+                        {
+                            let start = tags[needle];
+                            if start.1 == c::thumb::Tag::Thumb
+                            {
+                                if let Some(end) = tags.get(needle + 1)
+                                {
+                                    if end.1 == c::thumb::Tag::Thumb
+                                    {
+                                        size = end.0 - start.0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let start = (address - stext) as usize;
+                    let end = start + size as usize;
+                    let (bls, bs, indirect, modifies_sp, our_stack) = c::thumb::analyze(
+                        &text[start..end],
+                        address,
+                        self.target == c::Target::Thumbv7m,
+                        &tags,
+                    );
+                    let caller = self.indices[&canonical_name];
+
+                    // sanity check
+                    if let Some(stack) = our_stack
+                    {
+                        assert_eq!(
+                            stack != 0,
+                            modifies_sp,
+                            "BUG: our analysis reported that `{}` both uses {} bytes of stack and \
+                             it does{} modify SP",
+                            canonical_name,
+                            stack,
+                            if !modifies_sp { " not" } else { "" }
+                        );
+                    }
+
+                    // check the correctness of `modifies_sp` and `our_stack`
+                    // also override LLVM's results when they appear to be wrong
+                    if let c::Local::Exact(ref mut llvm_stack) = self.g[caller].local
+                    {
+                        if let Some(stack) = our_stack
+                        {
+                            if *llvm_stack != stack && self.fns_containing_asm.contains(&canonical_name)
+                            {
+                                // LLVM's stack usage analysis ignores inline asm, so its results can
+                                // be wrong here
+
+                                warn!(
+                                    "LLVM reported that `{}` uses {} bytes of stack but \
+                                     our analysis reported {} bytes; overriding LLVM's result (function \
+                                     uses inline assembly)",
+                                    canonical_name, llvm_stack, stack
+                                );
+
+                                *llvm_stack = stack;
+                            }
+                            else if c::is_outlined_function(&canonical_name)
+                            {
+                                // ^ functions produced by LLVM's function outliner are not properly
+                                // analyzed by LLVM's emit-stack-sizes pass and are all assigned a stack
+                                // usage of 0 bytes, which is sometimes wrong
+                                if *llvm_stack == 0 && stack != *llvm_stack
+                                {
+                                    warn!(
+                                        "LLVM reported that `{}` uses {} bytes of stack but \
+                                         our analysis reported {} bytes; overriding LLVM's result \
+                                         (function was produced by LLVM's function outlining pass)",
+                                        canonical_name, llvm_stack, stack
+                                    );
+
+                                    *llvm_stack = stack;
+                                }
+                            }
+                            else
+                            {
+                                // in all other cases our results should match
+                                if stack != *llvm_stack
+                                {
+                                    warn!(
+                                        "BUG: LLVM reported that `{}` uses {} bytes of stack but \
+                                         our analysis reported {} bytes; overriding LLVM's result \
+                                         (this should match, it's probably a bug)",
+                                        canonical_name, llvm_stack, stack
+                                    );
+
+                                    *llvm_stack = stack;
+                                }
+                                //assert_eq!(
+                                //    *llvm_stack, stack,
+                                //    "BUG: LLVM reported that `{}` uses {} bytes of stack but \
+                                //     this doesn't match our analysis",
+                                //    canonical_name, llvm_stack
+                                //);
+                            }
+                        }
+
+                        assert_eq!(
+                            *llvm_stack != 0,
+                            modifies_sp,
+                            "BUG: LLVM reported that `{}` uses {} bytes of stack but this doesn't \
+                             match our analysis",
+                            canonical_name,
+                            *llvm_stack
+                        );
+                    }
+                    else if let Some(stack) = our_stack
+                    {
+                        self.g[caller].local = c::Local::Exact(stack);
+                    }
+                    else if !modifies_sp 
+                    {
+                        // this happens when the function contains intra-branches and our analysis gives
+                        // up (`our_stack == None`)
+                        self.g[caller].local = c::Local::Exact(0);
+                    }
+
+                    if self.g[caller].local == c::Local::Unknown 
+                    {
+                        warn!("no stack usage information for `{}`", canonical_name);
+                    }
+
+                    if !self.defined.contains(&canonical_name) && indirect
+                    {
+                        // this function performs an indirect function call and we have no type
+                        // information to narrow down the list of callees so inject the uncertainty
+                        // in the form of a call to an unknown function with unknown stack usage
+
+                        warn!(
+                            "`{}` performs an indirect function call and there's \
+                             no type information about the operation",
+                            canonical_name,
+                        );
+                        let callee = self.g.add_node( c::Node("?".to_string(), None, false) );
+                        self.g.add_edge(caller, callee, ());
+                    }
+
+                    let callees_seen = self.edges.entry(caller).or_default();
+                    for offset in bls
+                    {
+                        let addr = (address as i64 + i64::from(offset)) as u64;
+                        // address may be off by one due to the thumb bit being set
+                        let name = match self.addr2name.get(&addr)
+                        {
+                            Some(name) => name,
+                            None       =>
+                            {
+                                warn!("BUG? no symbol at address {}", addr);
+                                continue;
+                            }
+                        };
+
+                        let callee = self.indices[name];
+                        if !callees_seen.contains(&callee) 
+                        {
+                            self.g.add_edge(caller, callee, ());
+                            callees_seen.insert(callee);
+                        }
+                    }
+
+                    for offset in bs
+                    {
+                        let addr = (address as i32 + offset) as u32;
+
+                        if addr >= address && addr < (address + size) 
+                        {
+                            // intra-function B branches are not function calls
+                        } 
+                        else 
+                        {
+                            // address may be off by one due to the thumb bit being set
+                            let name = match self.addr2name.get(&(addr as u64))
+                            {
+                                Some(name) => name,
+                                None       =>
+                                {
+                                    warn!("BUG? no symbol at address {}", addr);
+                                    continue
+                                },
+                            };
+
+                            let callee = self.indices[name];
+                            if !callees_seen.contains(&callee) 
+                            {
+                                self.g.add_edge(caller, callee, ());
+                                callees_seen.insert(callee);
+                            }
+                        }
+                    }
+                }
+            } 
+            else 
+            {
+                error!(".text section not found")
+            }
+        }
+    }
+
+
+}
+
+
+
+
+
+
+/*      █████╗ ███╗   ██╗ █████╗ ██╗  ██╗   ██╗███████╗███████╗     */
+/*     ██╔══██╗████╗  ██║██╔══██╗██║  ╚██╗ ██╔╝╚══███╔╝██╔════╝     */
+/*     ███████║██╔██╗ ██║███████║██║   ╚████╔╝   ███╔╝ █████╗       */
+/*     ██╔══██║██║╚██╗██║██╔══██║██║    ╚██╔╝   ███╔╝  ██╔══╝       */
+/*     ██║  ██║██║ ╚████║██║  ██║███████╗██║   ███████╗███████╗     */
+/*     ╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚══════╝╚═╝   ╚══════╝╚══════╝     */
+
+
 /// Analyzes a subroutine and returns all the `BL` and `B` instructions in it, plus whether this
 /// function performs an indirect function call or not
-// NOTE we assume that `bytes` is always valid input so all errors are bugs
+///
+// NOTE: we assume that `bytes` is always valid input so all errors are bugs
 // Reference: ARMv7-M Architecture Reference Manual (ARM DDI 0403E.b)
 // Reference: ARMv6-M Architecture Reference Manual (ARM DDI 0419D)
 pub fn analyze(
@@ -693,3 +978,7 @@ mod tests {
         assert_eq!(str.4, Some(4));
     }
 }
+
+
+
+
